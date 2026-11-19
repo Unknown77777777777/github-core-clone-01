@@ -1,435 +1,486 @@
-// Git object model and the smart-HTTP pack protocol, implemented on node:crypto and
-// node:zlib only. No git binary, no dependencies.
-//
-// Object ids are SHA-1 over `<type> <size>\0` + bytes. Packfiles are written without deltas
-// (a plain pack is always accepted); packs read from clients are resolved with REF_DELTA and
-// OFS_DELTA support, since real pushes send deltas.
+import { createHash } from "node:crypto";
+import { deflateSync, inflateSync } from "node:zlib";
+import type { Repo, GitObject, ObjType } from "./store.ts";
+import { sha1Of, storeObject } from "./store.ts";
 
-import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
-
-export const ZERO_OID = '0'.repeat(40);
-const HEX40 = /^[0-9a-f]{40}$/;
-export function isObjectId(value: string): boolean {
-  return HEX40.test(value);
+// ---------- pkt-line ----------
+export function pktLine(s: string | Buffer): Buffer {
+  const payload = typeof s === "string" ? Buffer.from(s, "utf8") : s;
+  const len = payload.length + 4;
+  return Buffer.concat([Buffer.from(len.toString(16).padStart(4, "0"), "ascii"), payload]);
 }
 
-export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
-const TYPE_CODE: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
-const CODE_TYPE: Record<number, GitObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
-
-export interface GitObject {
-  readonly type: GitObjectType;
-  readonly data: Buffer;
+export function pktFlush(): Buffer {
+  return Buffer.from("0000", "ascii");
 }
 
-export function hashObject(type: GitObjectType, data: Buffer): string {
-  const hash = createHash('sha1');
-  hash.update(Buffer.from(`${type} ${data.length}\0`, 'utf8'));
-  hash.update(data);
-  return hash.digest('hex');
+export function pktDelim(): Buffer {
+  return Buffer.from("0001", "ascii");
 }
 
-export function storeObject(objects: Map<string, GitObject>, type: GitObjectType, data: Buffer): string {
-  const oid = hashObject(type, data);
-  if (!objects.has(oid)) objects.set(oid, { type, data });
-  return oid;
+export interface PktRead {
+  lines: Buffer[];
+  rest: Buffer;
 }
 
-// -------------------------------------------------------------------------------------------
-// trees and commits
-// -------------------------------------------------------------------------------------------
+// Read pkt-lines until a flush (0000). Returns payload lines (without the
+// 4-byte length prefix) and the unconsumed remainder.
+export function readPktLines(buf: Buffer): PktRead {
+  const lines: Buffer[] = [];
+  let off = 0;
+  while (off + 4 <= buf.length) {
+    const len = parseInt(buf.subarray(off, off + 4).toString("ascii"), 16);
+    if (Number.isNaN(len)) break;
+    if (len === 0) {
+      off += 4;
+      break;
+    }
+    if (len === 1) {
+      off += 4;
+      continue;
+    }
+    if (off + len > buf.length) break;
+    lines.push(buf.subarray(off + 4, off + len));
+    off += len;
+  }
+  return { lines, rest: buf.subarray(off) };
+}
+
+// ---------- objects ----------
+export function parseCommit(data: Buffer): { tree: string; parents: string[]; message: string } {
+  const text = data.toString("utf8");
+  const headEnd = text.indexOf("\n\n");
+  const head = headEnd >= 0 ? text.slice(0, headEnd) : text;
+  const message = headEnd >= 0 ? text.slice(headEnd + 2) : "";
+  let tree = "";
+  const parents: string[] = [];
+  for (const line of head.split("\n")) {
+    if (line.startsWith("tree ")) tree = line.slice(5).trim();
+    else if (line.startsWith("parent ")) parents.push(line.slice(7).trim());
+  }
+  return { tree, parents, message };
+}
 
 export interface TreeEntry {
-  readonly mode: string;
-  readonly name: string;
-  readonly oid: string;
+  mode: string;
+  name: string;
+  sha: string;
 }
 
 export function parseTree(data: Buffer): TreeEntry[] {
   const entries: TreeEntry[] = [];
-  let offset = 0;
-  while (offset < data.length) {
-    const space = data.indexOf(0x20, offset);
-    const nul = data.indexOf(0x00, space + 1);
-    if (space < 0 || nul < 0 || nul + 21 > data.length) throw new Error('malformed tree object');
-    entries.push({
-      mode: data.subarray(offset, space).toString('ascii'),
-      name: data.subarray(space + 1, nul).toString('utf8'),
-      oid: data.subarray(nul + 1, nul + 21).toString('hex'),
-    });
-    offset = nul + 21;
+  let off = 0;
+  while (off < data.length) {
+    const sp = data.indexOf(0x20, off);
+    if (sp < 0) break;
+    const mode = data.subarray(off, sp).toString("ascii");
+    const nul = data.indexOf(0, sp);
+    if (nul < 0) break;
+    const name = data.subarray(sp + 1, nul).toString("utf8");
+    const sha = data.subarray(nul + 1, nul + 21).toString("hex");
+    entries.push({ mode, name, sha });
+    off = nul + 21;
   }
   return entries;
 }
 
-function compareTreeNames(a: TreeEntry, b: TreeEntry): number {
-  const left = Buffer.from(a.mode === '40000' ? `${a.name}/` : a.name, 'utf8');
-  const right = Buffer.from(b.mode === '40000' ? `${b.name}/` : b.name, 'utf8');
-  return Buffer.compare(left, right);
-}
-
-export function buildTree(entries: readonly TreeEntry[]): Buffer {
-  const sorted = [...entries].sort(compareTreeNames);
+export function buildTree(entries: TreeEntry[]): Buffer {
+  const sorted = [...entries].sort((a, b) => {
+    const an = a.mode === "40000" ? a.name + "/" : a.name;
+    const bn = b.mode === "40000" ? b.name + "/" : b.name;
+    return an < bn ? -1 : an > bn ? 1 : 0;
+  });
   const parts: Buffer[] = [];
-  for (const entry of sorted) {
-    parts.push(Buffer.from(`${entry.mode} ${entry.name}\0`, 'utf8'));
-    parts.push(Buffer.from(entry.oid, 'hex'));
+  for (const e of sorted) {
+    parts.push(Buffer.from(e.mode + " " + e.name + "\0", "utf8"));
+    parts.push(Buffer.from(e.sha, "hex"));
   }
   return Buffer.concat(parts);
 }
 
-export interface CommitView {
-  readonly tree: string;
-  readonly parents: string[];
-  readonly author: string;
-  readonly committer: string;
-  readonly message: string;
+export function makeCommit(repo: Repo, treeSha: string, parents: string[], message: string): string {
+  const author = "Forge <forge@example.com> 1700000000 +0000";
+  let text = "tree " + treeSha + "\n";
+  for (const p of parents) text += "parent " + p + "\n";
+  text += "author " + author + "\ncommitter " + author + "\n\n" + message + "\n";
+  return storeObject(repo, "commit", Buffer.from(text, "utf8"));
 }
 
-export function parseCommit(data: Buffer): CommitView {
-  const blank = data.indexOf('\n\n');
-  const headerEnd = blank < 0 ? data.length : blank;
-  const headerText = data.subarray(0, headerEnd).toString('utf8');
-  const message = blank < 0 ? '' : data.subarray(blank + 2).toString('utf8');
-  let tree = '';
-  const parents: string[] = [];
-  let author = '';
-  let committer = '';
-  for (const line of headerText.split('\n')) {
-    if (!line) continue;
-    const space = line.indexOf(' ');
-    const key = space < 0 ? line : line.slice(0, space);
-    const value = space < 0 ? '' : line.slice(space + 1);
-    if (key === 'tree') tree = value;
-    else if (key === 'parent') parents.push(value);
-    else if (key === 'author') author = value;
-    else if (key === 'committer') committer = value;
+// Walk a tree path; returns the blob sha or null.
+export function lookupPath(repo: Repo, commitSha: string, path: string): { sha: string; mode: string; type: string } | null {
+  const commitObj = repo.objects.get(commitSha);
+  if (!commitObj || commitObj.type !== "commit") return null;
+  const { tree } = parseCommit(commitObj.data);
+  const parts = path.split("/").filter((p) => p.length > 0);
+  let curTree = tree;
+  for (let i = 0; i < parts.length; i++) {
+    const treeObj = repo.objects.get(curTree);
+    if (!treeObj) return null;
+    const entries = parseTree(treeObj.data);
+    const e = entries.find((x) => x.name === parts[i]);
+    if (!e) return null;
+    if (i === parts.length - 1) {
+      const obj = repo.objects.get(e.sha);
+      return { sha: e.sha, mode: e.mode, type: obj ? obj.type : "blob" };
+    }
+    if (e.mode !== "40000") return null;
+    curTree = e.sha;
   }
-  if (!isObjectId(tree)) throw new Error('commit has no valid tree header');
-  return { tree, parents, author, committer, message };
+  return null;
 }
 
-export function parseTag(data: Buffer): { object: string; type: GitObjectType; tag: string; message: string } {
-  const blank = data.indexOf('\n\n');
-  const headerEnd = blank < 0 ? data.length : blank;
-  const headers = new Map<string, string>();
-  for (const line of data.subarray(0, headerEnd).toString('utf8').split('\n')) {
-    if (!line) continue;
-    const space = line.indexOf(' ');
-    if (space < 0) continue;
-    headers.set(line.slice(0, space), line.slice(space + 1));
-  }
-  return {
-    object: headers.get('object') ?? '',
-    type: (headers.get('type') ?? 'commit') as GitObjectType,
-    tag: headers.get('tag') ?? '',
-    message: blank < 0 ? '' : data.subarray(blank + 2).toString('utf8'),
+// List all files (path -> blob sha) under a commit's tree.
+export function listFiles(repo: Repo, commitSha: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const commitObj = repo.objects.get(commitSha);
+  if (!commitObj || commitObj.type !== "commit") return out;
+  const { tree } = parseCommit(commitObj.data);
+  const walk = (treeSha: string, prefix: string) => {
+    const obj = repo.objects.get(treeSha);
+    if (!obj) return;
+    for (const e of parseTree(obj.data)) {
+      if (e.mode === "40000") walk(e.sha, prefix + e.name + "/");
+      else out.set(prefix + e.name, e.sha);
+    }
   };
-}
-
-const IDENTITY = 'Conformance <conformance@make.fun>';
-const FIXED_EPOCH = 1700000000;
-
-export function buildCommit(tree: string, parents: readonly string[], message: string): Buffer {
-  const lines = [`tree ${tree}`];
-  for (const parent of parents) lines.push(`parent ${parent}`);
-  lines.push(`author ${IDENTITY} ${FIXED_EPOCH} +0000`, `committer ${IDENTITY} ${FIXED_EPOCH} +0000`, '');
-  return Buffer.from(`${lines.join('\n')}\n${message}`, 'utf8');
-}
-
-/** Every object reachable from `roots` (commit -> tree + parents, tree -> entries, tag -> target). */
-export function collectReachable(
-  roots: Iterable<string>,
-  lookup: (oid: string) => GitObject | undefined,
-  opts: { allowMissing?: boolean } = {},
-): Set<string> {
-  const seen = new Set<string>();
-  const queue: string[] = [];
-  for (const root of roots) if (isObjectId(root)) queue.push(root);
-  while (queue.length) {
-    const oid = queue.pop()!;
-    if (seen.has(oid)) continue;
-    const object = lookup(oid);
-    if (!object) {
-      if (opts.allowMissing) continue;
-      throw new Error(`object ${oid} is missing from the store`);
-    }
-    seen.add(oid);
-    if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
-      queue.push(commit.tree);
-      for (const parent of commit.parents) queue.push(parent);
-    } else if (object.type === 'tag') {
-      queue.push(parseTag(object.data).object);
-    } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) {
-        if (entry.mode === '160000') continue;
-        queue.push(entry.oid);
-      }
-    }
-  }
-  return seen;
-}
-
-// -------------------------------------------------------------------------------------------
-// pkt-line
-// -------------------------------------------------------------------------------------------
-
-export function encodePktLine(payload: string | Buffer): Buffer {
-  const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const len = body.length + 4;
-  const header = Buffer.alloc(4);
-  header.write(len.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([header, body]);
-}
-
-export function pktFlush(): Buffer {
-  return Buffer.from('0000', 'ascii');
-}
-
-export function pktDelim(): Buffer {
-  return Buffer.from('0001', 'ascii');
-}
-
-export type Pkt = { kind: 'data'; payload: Buffer } | { kind: 'flush' } | { kind: 'delim' };
-
-/** Decode a whole buffer of pkt-lines into packets (flush/delim/data). */
-export function decodePktLines(bytes: Buffer): Pkt[] {
-  const packets: Pkt[] = [];
-  let offset = 0;
-  while (offset < bytes.length) {
-    if (offset + 4 > bytes.length) throw new Error('truncated pkt-line');
-    const len = parseInt(bytes.subarray(offset, offset + 4).toString('ascii'), 16);
-    if (Number.isNaN(len)) throw new Error('bad pkt-line length');
-    if (len === 0) {
-      packets.push({ kind: 'flush' });
-      offset += 4;
-      continue;
-    }
-    if (len === 1) {
-      packets.push({ kind: 'delim' });
-      offset += 4;
-      continue;
-    }
-    if (len < 4 || offset + len > bytes.length) throw new Error('bad pkt-line length');
-    packets.push({ kind: 'data', payload: bytes.subarray(offset + 4, offset + len) });
-    offset += len;
-  }
-  return packets;
-}
-
-export function pktLinesToText(packets: readonly Pkt[]): string[] {
-  const lines: string[] = [];
-  for (const packet of packets) {
-    if (packet.kind === 'data') lines.push(packet.payload.toString('utf8'));
-  }
-  return lines;
-}
-
-// -------------------------------------------------------------------------------------------
-// packfiles
-// -------------------------------------------------------------------------------------------
-
-function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
-  const code = TYPE_CODE[type];
-  const bytes: number[] = [];
-  let remaining = size;
-  let first = (code << 4) | (remaining & 0x0f);
-  remaining = Math.floor(remaining / 16);
-  while (remaining > 0) {
-    bytes.push(first | 0x80);
-    first = remaining & 0x7f;
-    remaining = Math.floor(remaining / 128);
-  }
-  bytes.push(first);
-  return Buffer.from(bytes);
-}
-
-/** Build a packfile from plain objects (no deltas). Trailer is SHA-1 over everything before it. */
-export function writePack(objects: readonly GitObject[]): Buffer {
-  const parts: Buffer[] = [];
-  const header = Buffer.alloc(12);
-  header.write('PACK', 0, 4, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(objects.length, 8);
-  parts.push(header);
-  for (const object of objects) {
-    parts.push(writePackObjectHeader(object.type, object.data.length));
-    // Level 1: the client only needs a valid zlib stream, and pack bytes are small;
-    // fast compression keeps 50 concurrent clones off the single thread.
-    parts.push(deflateSync(object.data, { level: 1 }));
-  }
-  const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
-}
-
-function readVarint(buffer: Buffer, start: number): { size: number; next: number } {
-  let byte = buffer[start];
-  let size = byte & 0x0f;
-  let shift = 4;
-  let offset = start + 1;
-  while (byte & 0x80) {
-    if (offset >= buffer.length) throw new Error('pack entry size varint truncated');
-    byte = buffer[offset++];
-    size += (byte & 0x7f) * 2 ** shift;
-    shift += 7;
-  }
-  return { size, next: offset };
-}
-
-function readOfsDeltaBase(buffer: Buffer, start: number): { baseOffset: number; next: number } {
-  let byte = buffer[start];
-  let offset = start + 1;
-  let value = byte & 0x7f;
-  while (byte & 0x80) {
-    if (offset >= buffer.length) throw new Error('ofs-delta base offset truncated');
-    byte = buffer[offset++];
-    value = ((value + 1) * 128) + (byte & 0x7f);
-  }
-  return { baseOffset: value, next: offset };
-}
-
-function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
-  const result = inflateSync(buffer.subarray(offset), { info: true }) as unknown as {
-    buffer: Buffer;
-    engine: { bytesWritten: number };
-  };
-  return { data: result.buffer, next: offset + result.engine.bytesWritten };
-}
-
-/** Apply a git delta to a base object. */
-export function applyDelta(base: Buffer, delta: Buffer): Buffer {
-  let offset = 0;
-  const readVarintDelta = (): number => {
-    let value = 0;
-    let shift = 0;
-    for (;;) {
-      const byte = delta[offset++];
-      value |= (byte & 0x7f) << shift;
-      shift += 7;
-      if (!(byte & 0x80)) break;
-    }
-    return value;
-  };
-  const baseSize = readVarintDelta();
-  if (baseSize !== base.length) throw new Error('delta base size mismatch');
-  const resultSize = readVarintDelta();
-  const parts: Buffer[] = [];
-  let total = 0;
-  while (offset < delta.length) {
-    const opcode = delta[offset++];
-    if (opcode & 0x80) {
-      let copyOffset = 0;
-      let copySize = 0;
-      for (let i = 0; i < 4; i += 1) {
-        if (opcode & (1 << i)) copyOffset |= delta[offset++] << (8 * i);
-      }
-      for (let i = 0; i < 3; i += 1) {
-        if (opcode & (0x10 << i)) copySize |= delta[offset++] << (8 * i);
-      }
-      if (copySize === 0) copySize = 0x10000;
-      parts.push(base.subarray(copyOffset, copyOffset + copySize));
-      total += copySize;
-    } else if (opcode !== 0) {
-      parts.push(delta.subarray(offset, offset + opcode));
-      offset += opcode;
-      total += opcode;
-    } else {
-      throw new Error('delta opcode 0');
-    }
-  }
-  const out = Buffer.concat(parts);
-  if (out.length !== resultSize || total !== resultSize) throw new Error('delta result size mismatch');
+  walk(tree, "");
   return out;
 }
 
-export interface PackEntry {
-  readonly offset: number;
-  readonly type: GitObjectType;
-  readonly data: Buffer;
-  readonly oid: string;
+// Replace (or delete, when content is null) one path in a tree, returning
+// the new root tree sha. Creates new tree/blob objects in the store.
+export function setPathInTree(repo: Repo, rootTreeSha: string, path: string, content: Buffer | null): string {
+  const parts = path.split("/").filter((p) => p.length > 0);
+  const rec = (treeSha: string | null, idx: number): string => {
+    let entries: TreeEntry[] = [];
+    if (treeSha) {
+      const obj = repo.objects.get(treeSha);
+      if (obj) entries = parseTree(obj.data);
+    }
+    const name = parts[idx];
+    const last = idx === parts.length - 1;
+    if (last) {
+      entries = entries.filter((e) => e.name !== name);
+      if (content !== null) {
+        const blobSha = storeObject(repo, "blob", content);
+        entries.push({ mode: "100644", name, sha: blobSha });
+      }
+    } else {
+      const existing = entries.find((e) => e.name === name);
+      const childSha = rec(existing && existing.mode === "40000" ? existing.sha : null, idx + 1);
+      entries = entries.filter((e) => e.name !== name);
+      // Keep empty dirs out: if the child tree is empty, drop it.
+      const childObj = repo.objects.get(childSha);
+      if (childObj && childObj.data.length > 0) {
+        entries.push({ mode: "40000", name, sha: childSha });
+      }
+    }
+    return storeObject(repo, "tree", buildTree(entries));
+  };
+  return rec(rootTreeSha, 0);
 }
 
-/** Parse a packfile, resolving OFS_DELTA and REF_DELTA entries. `resolveBase` finds objects the pack references from outside (thin packs). */
-export function readPack(
-  pack: Buffer,
-  resolveBase?: (oid: string) => GitObject | undefined,
-): Map<string, GitObject> {
-  if (pack.length < 32 || pack.subarray(0, 4).toString('ascii') !== 'PACK') {
-    throw new Error('not a packfile');
+export function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
+  if (ancestor === descendant) return true;
+  const seen = new Set<string>();
+  const stack = [descendant];
+  while (stack.length > 0) {
+    const cur = stack.pop() as string;
+    if (cur === ancestor) return true;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    const obj = repo.objects.get(cur);
+    if (!obj || obj.type !== "commit") continue;
+    for (const p of parseCommit(obj.data).parents) stack.push(p);
+  }
+  return false;
+}
+
+export function mergeBase(repo: Repo, a: string, b: string): string | null {
+  const ancA = new Set<string>();
+  const stack = [a];
+  while (stack.length > 0) {
+    const cur = stack.pop() as string;
+    if (ancA.has(cur)) continue;
+    ancA.add(cur);
+    const obj = repo.objects.get(cur);
+    if (!obj || obj.type !== "commit") continue;
+    for (const p of parseCommit(obj.data).parents) stack.push(p);
+  }
+  const queue = [b];
+  const seen = new Set<string>();
+  while (queue.length > 0) {
+    const cur = queue.shift() as string;
+    if (ancA.has(cur)) return cur;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    const obj = repo.objects.get(cur);
+    if (!obj || obj.type !== "commit") continue;
+    for (const p of parseCommit(obj.data).parents) queue.push(p);
+  }
+  return null;
+}
+
+// ---------- packfile reading ----------
+function applyDelta(base: Buffer, delta: Buffer): Buffer {
+  let off = 0;
+  const readVarint = (): number => {
+    let out = 0;
+    let shift = 0;
+    while (off < delta.length) {
+      const b = delta[off++];
+      out |= (b & 0x7f) << shift;
+      shift += 7;
+      if (!(b & 0x80)) break;
+    }
+    return out;
+  };
+  const srcSize = readVarint();
+  const dstSize = readVarint();
+  void srcSize;
+  const parts: Buffer[] = [];
+  let total = 0;
+  while (off < delta.length) {
+    const op = delta[off++];
+    if (op & 0x80) {
+      let cpOff = 0;
+      let cpSize = 0;
+      for (let i = 0; i < 4; i++) {
+        if (op & (1 << i)) cpOff |= delta[off++] << (i * 8);
+      }
+      for (let i = 0; i < 3; i++) {
+        if (op & (0x10 << i)) cpSize |= delta[off++] << (i * 8);
+      }
+      if (cpSize === 0) cpSize = 0x10000;
+      parts.push(base.subarray(cpOff, cpOff + cpSize));
+      total += cpSize;
+    } else if (op) {
+      parts.push(delta.subarray(off, off + op));
+      off += op;
+      total += op;
+    } else {
+      throw new Error("bad delta opcode 0");
+    }
+  }
+  const out = Buffer.concat(parts);
+  if (out.length !== dstSize) throw new Error("delta size mismatch");
+  return out;
+}
+
+export function parsePack(repo: Repo, pack: Buffer): string[] {
+  if (pack.length < 12 || pack.subarray(0, 4).toString("ascii") !== "PACK") {
+    throw new Error("not a packfile");
   }
   const count = pack.readUInt32BE(8);
-  const objects = new Map<string, GitObject>();
-  const byOffset = new Map<number, GitObject>();
-  interface Pending { offset: number; kind: 'ofs' | 'ref'; base: number | string; data: Buffer; }
-  const pending: Pending[] = [];
-  let offset = 12;
-  for (let i = 0; i < count; i += 1) {
-    const entryOffset = offset;
-    const { size, next } = readVarint(pack, offset);
-    const first = pack[offset];
-    const typeCode = (first >> 4) & 0x07;
-    offset = next;
-    if (typeCode === 6) {
-      const { baseOffset, next: afterBase } = readOfsDeltaBase(pack, offset);
-      const { data, next: afterData } = inflateAt(pack, afterBase);
-      pending.push({ offset: entryOffset, kind: 'ofs', base: entryOffset - baseOffset, data });
-      offset = afterData;
-    } else if (typeCode === 7) {
-      const baseOid = pack.subarray(offset, offset + 20).toString('hex');
-      offset += 20;
-      const { data, next: afterData } = inflateAt(pack, offset);
-      pending.push({ offset: entryOffset, kind: 'ref', base: baseOid, data });
-      offset = afterData;
-    } else {
-      const type = CODE_TYPE[typeCode];
-      if (!type) throw new Error(`unknown pack object type ${typeCode}`);
-      const { data, next: afterData } = inflateAt(pack, offset);
-      if (data.length !== size) throw new Error('pack object size mismatch');
-      const oid = hashObject(type, data);
-      const obj = { type, data };
-      objects.set(oid, obj);
-      byOffset.set(entryOffset, obj);
-      offset = afterData;
+  let off = 12;
+  const parsed: { sha: string; type: ObjType; data: Buffer; ofs: number }[] = [];
+  const byOffset = new Map<number, { type: ObjType; data: Buffer }>();
+  const readObjectHeader = (): { typeNum: number; size: number } => {
+    const b0 = pack[off++];
+    let typeNum = (b0 >> 4) & 0x7;
+    let size = b0 & 0x0f;
+    let shift = 4;
+    while (b0 & 0x80) {
+      const b = pack[off++];
+      size |= (b & 0x7f) << shift;
+      shift += 7;
+      if (!(b & 0x80)) break;
     }
-  }
-  // Resolve deltas; a delta's base may itself be a delta, so loop until none remain.
-  let remaining = pending;
-  while (remaining.length) {
-    const nextPending: Pending[] = [];
-    let progressed = false;
-    for (const entry of remaining) {
-      let baseObj: GitObject | undefined;
-      if (entry.kind === 'ofs') baseObj = byOffset.get(entry.base as number);
-      else baseObj = objects.get(entry.base as string) ?? resolveBase?.(entry.base as string);
-      if (!baseObj) {
-        nextPending.push(entry);
-        continue;
+    return { typeNum, size };
+  };
+  const typeNames: Record<number, ObjType> = { 1: "commit", 2: "tree", 3: "blob", 4: "tag" };
+  for (let i = 0; i < count; i++) {
+    const start = off;
+    const { typeNum, size } = readObjectHeader();
+    if (typeNum === 6) {
+      // ofs-delta: negative offset varint
+      let b = pack[off++];
+      let ofs = b & 0x7f;
+      while (b & 0x80) {
+        b = pack[off++];
+        ofs = ((ofs + 1) << 7) | (b & 0x7f);
       }
-      const data = applyDelta(baseObj.data, entry.data);
-      const oid = hashObject(baseObj.type, data);
-      const obj = { type: baseObj.type, data };
-      objects.set(oid, obj);
-      byOffset.set(entry.offset, obj);
-      progressed = true;
+      const baseOff = start - ofs;
+      const inflated = inflateSync(pack.subarray(off));
+      const consumed = pack.length - off - 0; // inflateSync consumes whole slice; compute via zlib length below
+      void consumed;
+      // Determine consumed bytes by re-inflating with a bounded approach:
+      // use the trailing trailer: we instead inflate incrementally using
+      // inflateSync on progressively larger slices is wasteful; use a
+      // manual scan: zlib streams end with adler32, find via inflate of
+      // the remaining buffer truncated at the next object is unknown.
+      // Practical approach: inflate the rest and measure with a helper
+      // that reports unused bytes by trying lengths is expensive.
+      // Instead we rely on node zlib: inflateSync throws on trailing
+      // garbage only when strict; we compute consumed by binary search
+      // on the smallest prefix that inflates to `size` bytes of delta.
+      const delta = inflateToSize(pack, off, size);
+      const base = byOffset.get(baseOff);
+      if (!base) throw new Error("ofs-delta base missing");
+      const data = applyDelta(base.data, delta);
+      const sha = sha1Of(base.type, data);
+      parsed.push({ sha, type: base.type, data, ofs: start });
+      byOffset.set(start, { type: base.type, data });
+      off += zlibConsumed(pack, off, size);
+    } else if (typeNum === 7) {
+      const baseSha = pack.subarray(off, off + 20).toString("hex");
+      off += 20;
+      const delta = inflateToSize(pack, off, size);
+      const baseObj = repo.objects.get(baseSha) || parsed.find((p) => p.sha === baseSha);
+      if (!baseObj) throw new Error("ref-delta base missing " + baseSha);
+      const data = applyDelta(baseObj.data, delta);
+      const sha = sha1Of(baseObj.type, data);
+      parsed.push({ sha, type: baseObj.type, data, ofs: start });
+      byOffset.set(start, { type: baseObj.type, data });
+      off += zlibConsumed(pack, off, size);
+    } else {
+      const type = typeNames[typeNum];
+      if (!type) throw new Error("unknown pack type " + typeNum);
+      const data = inflateToSize(pack, off, size);
+      const sha = sha1Of(type, data);
+      parsed.push({ sha, type, data, ofs: start });
+      byOffset.set(start, { type, data });
+      off += zlibConsumed(pack, off, size);
     }
-    if (!progressed) throw new Error('pack delta base is missing');
-    remaining = nextPending;
   }
-  return objects;
+  for (const p of parsed) {
+    if (!repo.objects.has(p.sha)) repo.objects.set(p.sha, { type: p.type, data: p.data });
+  }
+  return parsed.map((p) => p.sha);
 }
 
-/** Split a pack into sideband band-1 pkt-lines (max payload per pkt-line). */
-export function sidebandPack(pack: Buffer): Buffer {
-  const chunks: Buffer[] = [];
-  const MAX = 65516 - 1;
-  for (let offset = 0; offset < pack.length; offset += MAX) {
-    const slice = pack.subarray(offset, Math.min(pack.length, offset + MAX));
-    chunks.push(encodePktLine(Buffer.concat([Buffer.from([1]), slice])));
-  }
-  if (chunks.length === 0) {
-    chunks.push(encodePktLine(Buffer.from([1])));
-  }
-  return Buffer.concat(chunks);
+// Inflate a zlib stream starting at `off`, expected to produce `size` bytes.
+// Returns the inflated bytes (binary search for the exact stream length).
+function inflateToSize(pack: Buffer, off: number, size: number): Buffer {
+  const len = zlibConsumed(pack, off, size);
+  return inflateSync(pack.subarray(off, off + len));
 }
+
+// Find how many bytes the zlib stream at `off` occupies by binary search:
+// the smallest prefix that inflates successfully to `size` bytes.
+const consumedCache = new WeakMap<Buffer, Map<string, number>>();
+function zlibConsumed(pack: Buffer, off: number, size: number): number {
+  let lo = 1;
+  let hi = pack.length - off;
+  // Exponential probe first: try doubling lengths to bound the search.
+  let probe = 16;
+  while (probe < hi) {
+    try {
+      const out = inflateSync(pack.subarray(off, off + probe));
+      if (out.length === size) {
+        hi = probe;
+        break;
+      }
+      if (out.length > size) break;
+    } catch {
+      // not complete yet
+    }
+    probe *= 2;
+  }
+  if (probe < hi) hi = probe;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    try {
+      const out = inflateSync(pack.subarray(off, off + mid));
+      if (out.length === size) hi = mid;
+      else lo = mid + 1;
+    } catch {
+      lo = mid + 1;
+    }
+  }
+  return lo;
+}
+
+// ---------- packfile writing ----------
+export function collectReachable(repo: Repo, wants: string[], haves: Set<string>, shallow: Set<string>): Map<string, GitObject> {
+  const out = new Map<string, GitObject>();
+  const haveAncestors = new Set<string>();
+  // Everything reachable from a have is excluded.
+  const markHave = (sha: string) => {
+    const stack = [sha];
+    while (stack.length > 0) {
+      const cur = stack.pop() as string;
+      if (haveAncestors.has(cur)) continue;
+      haveAncestors.add(cur);
+      const obj = repo.objects.get(cur);
+      if (!obj) continue;
+      if (obj.type === "commit") {
+        const { tree, parents } = parseCommit(obj.data);
+        stack.push(tree);
+        for (const p of parents) stack.push(p);
+      } else if (obj.type === "tree") {
+        for (const e of parseTree(obj.data)) stack.push(e.sha);
+      }
+    }
+  };
+  for (const h of haves) markHave(h);
+  const visit = (sha: string, depth: number) => {
+    if (haveAncestors.has(sha) || out.has(sha)) return;
+    const obj = repo.objects.get(sha);
+    if (!obj) return;
+    out.set(sha, obj);
+    if (obj.type === "commit") {
+      const { tree, parents } = parseCommit(obj.data);
+      visit(tree, depth);
+      if (!shallow.has(sha)) {
+        for (const p of parents) visit(p, depth + 1);
+      }
+    } else if (obj.type === "tree") {
+      for (const e of parseTree(obj.data)) visit(e.sha, depth);
+    }
+  };
+  for (const w of wants) visit(w, 0);
+  return out;
+}
+
+export function buildPack(objects: Map<string, GitObject>): Buffer {
+  const parts: Buffer[] = [];
+  const header = Buffer.alloc(12);
+  header.write("PACK", 0, "ascii");
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(objects.size, 8);
+  parts.push(header);
+  const typeNums: Record<string, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+  // Deterministic order: commits first (sorted by sha), then trees, then blobs.
+  const sorted = [...objects.entries()].sort((a, b) => {
+    const ta = typeNums[a[1].type] - typeNums[b[1].type];
+    return ta !== 0 ? ta : a[0] < b[0] ? -1 : 1;
+  });
+  for (const [, obj] of sorted) {
+    const typeNum = typeNums[obj.type];
+    const size = obj.data.length;
+    const hdr: number[] = [];
+    let b = (typeNum << 4) | (size & 0x0f);
+    let rest = size >> 4;
+    if (rest > 0) b |= 0x80;
+    hdr.push(b);
+    while (rest > 0) {
+      let nb = rest & 0x7f;
+      rest >>= 7;
+      if (rest > 0) nb |= 0x80;
+      hdr.push(nb);
+    }
+    parts.push(Buffer.from(hdr));
+    parts.push(deflateSync(obj.data, { level: 1 }));
+  }
+  const body = Buffer.concat(parts);
+  const trailer = createHash("sha1").update(body).digest();
+  return Buffer.concat([body, trailer]);
+}
+
+export function refsOf(repo: Repo): { name: string; sha: string }[] {
+  const refs: { name: string; sha: string }[] = [];
+  const branches = [...repo.branches.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  for (const [name, sha] of branches) {
+    refs.push({ name: "refs/heads/" + name, sha });
+  }
+  const head = repo.branches.get(repo.defaultBranch);
+  if (head) refs.push({ name: "HEAD", sha: head });
+  return refs;
+}
+
+export function looseObjectBytes(obj: GitObject): Buffer {
+  const header = Buffer.from(obj.type + " " + obj.data.length + "\0", "utf8");
+  return Buffer.concat([header, obj.data]);
+}
+void looseObjectBytes;
